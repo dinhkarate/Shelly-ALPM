@@ -13,6 +13,7 @@ const PkgBuild = @import("../../models/pkgbuild.zig").PkgBuild;
 const runtime = @import("../../services/runtime.zig");
 const features = @import("../../services/build_features.zig");
 const InstallReview = @import("pkg_build.zig").PkgbuildReviewDialog;
+const ansi = @import("../../helpers/ansi.zig");
 
 pub const PkgbuildReviewDialog = extern struct {
     parent_instance: Parent,
@@ -327,10 +328,16 @@ pub const PkgbuildReviewDialog = extern struct {
             page.show_scan(scan, arena.allocator()) catch |err| page.request_failure(true, err, null);
             return 0;
         }
-        const text = arena.allocator().dupeSentinel(u8, package.PkgBuild, 0) catch {
+        const raw_text = arena.allocator().dupeSentinel(u8, package.PkgBuild, 0) catch {
             page.show_failure(error.OutOfMemory, null);
             return 0;
         };
+        // A PKGBUILD pasted from a terminal can carry escape codes; the
+        // preview shows source, so the visible text is all that matters.
+        const text = if (std.mem.indexOfScalar(u8, raw_text, 0x1b) == null)
+            raw_text
+        else
+            arena.allocator().dupeSentinel(u8, ansi.strip(arena.allocator(), raw_text) catch raw_text, 0) catch raw_text;
         const view = gtk.TextView.new();
         gtk.TextView.setEditable(view, 0);
         gtk.TextView.setMonospace(view, 1);

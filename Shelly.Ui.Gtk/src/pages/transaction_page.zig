@@ -6,6 +6,8 @@ const glib = bindings.glib;
 const gobject = bindings.gobject;
 const support = @import("support.zig");
 const a11y = @import("../helpers/a11y.zig");
+const ansi = @import("../helpers/ansi.zig");
+const pango = bindings.pango;
 const ShellyOperation = @import("../services/shelly_operation.zig").ShellyOperation;
 const Event = @import("../services/shelly_operation.zig").Event;
 const ShellyWindow = @import("../shelly_window.zig").ShellyWindow;
@@ -359,10 +361,13 @@ pub const TransactionPage = extern struct {
                 append_terminal(self, e.message);
                 const p = self.priv();
                 if (p.arena) |arena| {
+                    // The summary is shown in labels and read out by screen
+                    // readers, so it must carry the visible text only.
+                    const message = ansi.strip(arena.allocator(), e.message) catch e.message;
                     const previous = p.failure_message orelse "";
-                    if (std.mem.indexOf(u8, previous, e.message) == null)
+                    if (std.mem.indexOf(u8, previous, message) == null)
                         p.failure_message = std.fmt.allocPrint(arena.allocator(), "{s}{s}{s}", .{
-                            previous, if (previous.len > 0) "\n\n" else "", e.message,
+                            previous, if (previous.len > 0) "\n\n" else "", message,
                         }) catch p.failure_message;
                 }
             },
@@ -773,36 +778,149 @@ pub const TransactionPage = extern struct {
     fn append_terminal(self: *Self, text: []const u8) void {
         const p = self.priv();
         const normalized = normalizeTerminalText(text);
+        // Terminal control codes differ between two messages that read the
+        // same, so deduplicate on the visible text only.
+        const dedupe_key = if (p.arena) |arena|
+            ansi.strip(arena.allocator(), normalized) catch normalized
+        else
+            normalized;
         if (p.arena) |arena| {
-            if (!rememberTerminalLine(arena.allocator(), &p.terminal_lines, normalized)) return;
+            if (!rememberTerminalLine(arena.allocator(), &p.terminal_lines, dedupe_key)) return;
         }
 
         const buffer = gtk.TextView.getBuffer(p.terminal_view);
+        self.insertStyled(buffer, normalized);
+
         var end: gtk.TextIter = undefined;
         gtk.TextBuffer.getEndIter(buffer, &end);
-
-        const normalized_z = std.heap.c_allocator.dupeSentinel(u8, normalized, 0) catch return;
-        defer std.heap.c_allocator.free(normalized_z);
-        gtk.TextBuffer.insert(buffer, &end, normalized_z, @intCast(normalized.len));
         gtk.TextBuffer.insert(buffer, &end, "\n", 1);
 
         self.scrollTerminalToBottom();
     }
 
-    fn scratchZ(self: *Self, s: []const u8) [:0]const u8 {
-        const p = self.priv();
-        const n = @min(s.len, p.scratch.len - 1);
-        @memcpy(p.scratch[0..n], s[0..n]);
-        p.scratch[n] = 0;
-        return p.scratch[0..n :0];
+    /// Appends `text` to the end of `buffer`, rendering any ANSI styling
+    /// with cached text tags and dropping the control sequences themselves.
+    fn insertStyled(self: *Self, buffer: *gtk.TextBuffer, text: []const u8) void {
+        var at: gtk.TextIter = undefined;
+        gtk.TextBuffer.getEndIter(buffer, &at);
+        self.insertStyledAt(buffer, &at, text);
+    }
+
+    /// Inserts `text` at `at`, advancing the iterator, applying each
+    /// segment's style through a tag cached in the buffer's tag table.
+    fn insertStyledAt(self: *Self, buffer: *gtk.TextBuffer, at: *gtk.TextIter, text: []const u8) void {
+        var parser = ansi.Parser.init(text);
+        while (parser.next()) |segment| {
+            if (segment.text.len == 0) continue;
+            const owned = std.heap.c_allocator.dupeSentinel(u8, segment.text, 0) catch continue;
+            defer std.heap.c_allocator.free(owned);
+
+            const start = gtk.TextIter.getOffset(at);
+            gtk.TextBuffer.insert(buffer, at, owned.ptr, @intCast(segment.text.len));
+
+            if (segment.style.isDefault()) continue;
+            var name_buf: [3 + 16 + 1:0]u8 = undefined;
+            const name = std.fmt.bufPrintSentinel(
+                &name_buf,
+                "sgr-{x}",
+                .{segment.style.bits()},
+                0,
+            ) catch continue;
+            if (self.ensureStyleTag(buffer, segment.style, name)) |tag| {
+                var seg_start: gtk.TextIter = undefined;
+                gtk.TextBuffer.getIterAtOffset(buffer, &seg_start, @intCast(start));
+                var seg_end: gtk.TextIter = undefined;
+                gtk.TextBuffer.getIterAtOffset(buffer, &seg_end, gtk.TextIter.getOffset(at));
+                gtk.TextBuffer.applyTag(buffer, tag, &seg_start, &seg_end);
+            }
+        }
+    }
+
+    /// Returns the tag for `style`, creating it in the buffer's tag table
+    /// the first time a style appears.
+    fn ensureStyleTag(
+        self: *Self,
+        buffer: *gtk.TextBuffer,
+        style: ansi.Style,
+        name: [:0]const u8,
+    ) ?*gtk.TextTag {
+        _ = self;
+        const table = gtk.TextBuffer.getTagTable(buffer);
+        if (gtk.TextTagTable.lookup(table, name.ptr)) |tag| return tag;
+
+        const tag = gtk.TextBuffer.createTag(buffer, name.ptr, null);
+
+        if (style.fg) |color| {
+            Self.setRgbaProperty(tag.as(gobject.Object), "foreground-rgba", color);
+            Self.setBooleanProperty(tag.as(gobject.Object), "foreground-set", true);
+        }
+        if (style.bg) |color| {
+            Self.setRgbaProperty(tag.as(gobject.Object), "background-rgba", color);
+            Self.setBooleanProperty(tag.as(gobject.Object), "background-set", true);
+        }
+        if (style.bold or style.faint) {
+            Self.setIntProperty(
+                tag.as(gobject.Object),
+                "weight",
+                if (style.bold) 700 else 200,
+            );
+        }
+        if (style.italic) {
+            Self.setIntProperty(tag.as(gobject.Object), "style", @backingInt(pango.Style.italic));
+        }
+        if (style.underline) {
+            Self.setIntProperty(
+                tag.as(gobject.Object),
+                "underline",
+                @backingInt(pango.Underline.single),
+            );
+        }
+        if (style.strikethrough) {
+            Self.setBooleanProperty(tag.as(gobject.Object), "strikethrough", true);
+        }
+        if (style.reverse) {
+            // The view has no solid background to swap with, so approximate
+            // reverse video with a bright foreground on a dark background.
+            if (style.fg == null) Self.setRgbaProperty(tag.as(gobject.Object), "foreground-rgba", 0xe5e5e5);
+            if (style.bg == null) Self.setRgbaProperty(tag.as(gobject.Object), "background-rgba", 0x3b3b3b);
+        }
+        return tag;
+    }
+
+    fn setRgbaProperty(object: *gobject.Object, property: [*:0]const u8, color: u24) void {
+        var rgba = gdk.RGBA{
+            .f_red = @as(f32, @floatFromInt((color >> 16) & 0xff)) / 255.0,
+            .f_green = @as(f32, @floatFromInt((color >> 8) & 0xff)) / 255.0,
+            .f_blue = @as(f32, @floatFromInt(color & 0xff)) / 255.0,
+            .f_alpha = 1.0,
+        };
+        var value = std.mem.zeroes(gobject.Value);
+        _ = value.init(gobject.typeFromName("GdkRGBA"));
+        value.setBoxed(@constCast(&rgba));
+        object.setProperty(property, &value);
+        value.unset();
+    }
+
+    fn setBooleanProperty(object: *gobject.Object, property: [*:0]const u8, enabled: bool) void {
+        var value = std.mem.zeroes(gobject.Value);
+        _ = value.init(gobject.typeFromName("gboolean"));
+        value.setBoolean(@intFromBool(enabled));
+        object.setProperty(property, &value);
+        value.unset();
+    }
+
+    fn setIntProperty(object: *gobject.Object, property: [*:0]const u8, number: c_int) void {
+        var value = std.mem.zeroes(gobject.Value);
+        _ = value.init(gobject.typeFromName("GInt"));
+        value.setInt(number);
+        object.setProperty(property, &value);
+        value.unset();
     }
 
     fn updateProgressLine(self: *Self, key: []const u8, text: []const u8) void {
         const p = self.priv();
         const normalized = normalizeTerminalText(text);
         const buffer = gtk.TextView.getBuffer(p.terminal_view);
-
-        const text_z = self.scratchZ(normalized);
 
         if (p.progress_lines.get(key)) |line| {
             var start: gtk.TextIter = undefined;
@@ -812,15 +930,18 @@ pub const TransactionPage = extern struct {
             if (gtk.TextIter.getCharsInLine(&end) > 0) {
                 _ = gtk.TextIter.forwardToLineEnd(&end);
             }
+            // Tags applied to the previous version of this line must not
+            // leak into the replacement text.
+            gtk.TextBuffer.removeAllTags(buffer, &start, &end);
             gtk.TextBuffer.delete(buffer, &start, &end);
             gtk.TextBuffer.getIterAtMark(buffer, &start, line.start);
-            gtk.TextBuffer.insert(buffer, &start, text_z, @intCast(normalized.len));
+            self.insertStyledAt(buffer, &start, normalized);
         } else {
             const arena = p.arena orelse return;
             var end: gtk.TextIter = undefined;
             gtk.TextBuffer.getEndIter(buffer, &end);
             const start_mark = gtk.TextBuffer.createMark(buffer, null, &end, 1);
-            gtk.TextBuffer.insert(buffer, &end, text_z, @intCast(normalized.len));
+            self.insertStyledAt(buffer, &end, normalized);
             const end_mark = gtk.TextBuffer.createMark(buffer, null, &end, 0);
             gtk.TextBuffer.insert(buffer, &end, "\n", 1);
 
@@ -835,8 +956,23 @@ pub const TransactionPage = extern struct {
         const p = self.priv();
         if (p.progress_lines.fetchRemove(key)) |kv| {
             const buffer = gtk.TextView.getBuffer(p.terminal_view);
+            // The line is finished: nothing will rewrite it, and an identical
+            // message arriving later should not be dropped as a duplicate, so
+            // release the text back to the duplicate-suppression map before
+            // the marks that locate it are gone.
+            var start: gtk.TextIter = undefined;
+            gtk.TextBuffer.getIterAtMark(buffer, &start, kv.value.start);
+            var end = start;
+            _ = gtk.TextIter.forwardToLineEnd(&end);
+            const text_z = gtk.TextBuffer.getText(buffer, &start, &end, 0);
+            const text = std.mem.span(text_z);
+            defer glib.free(text_z);
             gtk.TextBuffer.deleteMark(buffer, kv.value.start);
             gtk.TextBuffer.deleteMark(buffer, kv.value.end);
+            if (p.arena) |arena| {
+                const visible = ansi.strip(arena.allocator(), text) catch text;
+                _ = rememberTerminalLine(arena.allocator(), &p.terminal_lines, visible);
+            }
         }
     }
 
@@ -1519,4 +1655,20 @@ test "terminal output suppresses duplicate lines and preserves unique updates" {
         &lines,
         "Downloading firefox (10%)",
     ));
+}
+
+test "terminal deduplication ignores terminal control codes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var lines: std.StringHashMapUnmanaged(void) = .empty;
+
+    // The same progress line emitted twice with different styling must
+    // count as one entry, so the map keys carry the visible text only.
+    const first = try ansi.strip(arena.allocator(), "\x1b[1;32mDownloading firefox (10%)\x1b[0m");
+    const second = try ansi.strip(arena.allocator(), "\x1b[32mDownloading firefox (10%)\x1b[m\x1b[?2026h");
+    try std.testing.expect(std.mem.indexOfScalar(u8, first, 0x1b) == null);
+    try std.testing.expectEqualStrings(first, second);
+
+    try std.testing.expect(TransactionPage.rememberTerminalLine(arena.allocator(), &lines, first));
+    try std.testing.expect(!TransactionPage.rememberTerminalLine(arena.allocator(), &lines, second));
 }

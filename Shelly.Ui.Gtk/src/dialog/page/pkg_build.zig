@@ -5,6 +5,7 @@ const glib = bindings.glib;
 const gobject = bindings.gobject;
 const support = @import("../../pages/support.zig");
 const translations = @import("../../helpers/translations.zig");
+const ansi = @import("../../helpers/ansi.zig");
 
 pub const PkgbuildReviewDialog = extern struct {
     parent_instance: Parent,
@@ -108,7 +109,12 @@ pub const PkgbuildReviewDialog = extern struct {
                 gtk.TextBuffer.insert(diff_buffer, &diff_iter, "\n", 1);
             }
 
-            const parsed = parse_diff_line(raw);
+            // Diff lines copied from terminal output can carry escape codes;
+            // the review dialog renders plain styled markup.
+            const visible = stripEscapes(std.heap.c_allocator, raw) catch continue;
+            defer std.heap.c_allocator.free(visible);
+
+            const parsed = parse_diff_line(visible);
             const escaped = glib.markupEscapeText(@ptrCast(parsed.text.ptr), @intCast(parsed.text.len));
             defer glib.free(escaped);
 
@@ -121,7 +127,9 @@ pub const PkgbuildReviewDialog = extern struct {
             if (markup) |m| {
                 gtk.TextBuffer.insertMarkup(diff_buffer, &diff_iter, m, -1);
             } else {
-                gtk.TextBuffer.insert(diff_buffer, &diff_iter, raw, @intCast(raw.len));
+                const visible_z = std.heap.c_allocator.dupeSentinel(u8, visible, 0) catch continue;
+                defer std.heap.c_allocator.free(visible_z);
+                gtk.TextBuffer.insert(diff_buffer, &diff_iter, visible_z, @intCast(visible.len));
             }
         }
         gtk.Box.append(p.diff_box, diff_view.as(gtk.Widget));
@@ -276,6 +284,12 @@ pub const PkgbuildReviewDialog = extern struct {
         if (std.mem.eql(u8, tag, "yellow")) return "#e5a50a";
         if (std.mem.eql(u8, tag, "white")) return null;
         return null;
+    }
+
+    /// Drops terminal escape codes from text copied out of a console,
+    /// keeping the visible characters. The caller owns the result.
+    fn stripEscapes(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
+        return ansi.strip(alloc, text);
     }
 
     fn mark_changes_reviewed(self: *Self) void {
